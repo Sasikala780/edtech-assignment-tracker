@@ -1,0 +1,176 @@
+from fastapi import FastAPI, Depends, HTTPException, UploadFile
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from pydantic import BaseModel
+from typing import Optional, List
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from datetime import datetime, timedelta
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, ForeignKey
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, Session
+
+# Database config
+DATABASE_URL = "sqlite:///./edtech.db"
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(bind=engine)
+Base = declarative_base()
+
+# Security config
+SECRET_KEY = "mysecretkey"
+ALGORITHM = "HS256"
+TOKEN_EXPIRY = 30
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/login")
+
+# Models
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True)
+    name = Column(String)
+    email = Column(String, unique=True)
+    hashed_password = Column(String)
+    role = Column(String)
+
+class Assignment(Base):
+    __tablename__ = "assignments"
+    id = Column(Integer, primary_key=True)
+    title = Column(String)
+    description = Column(Text)
+    due_date = Column(DateTime)
+    teacher_id = Column(Integer, ForeignKey("users.id"))
+
+class Submission(Base):
+    __tablename__ = "submissions"
+    id = Column(Integer, primary_key=True)
+    assignment_id = Column(Integer, ForeignKey("assignments.id"))
+    student_id = Column(Integer, ForeignKey("users.id"))
+    content = Column(Text)
+    file_url = Column(String, nullable=True)
+    submitted_at = Column(DateTime, default=datetime.utcnow)
+
+Base.metadata.create_all(bind=engine)
+
+# Schemas
+class UserCreate(BaseModel):
+    name: str
+    email: str
+    password: str
+    role: str
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+class AssignmentCreate(BaseModel):
+    title: str
+    description: str
+    due_date: datetime
+
+class SubmissionCreate(BaseModel):
+    content: str
+    file_url: Optional[str] = None
+
+class SubmissionOut(BaseModel):
+    id: int
+    student_id: int
+    content: str
+    file_url: Optional[str]
+    submitted_at: datetime
+
+    class Config:
+        orm_mode = True
+
+# Utility functions
+def hash_password(password: str):
+    return pwd_context.hash(password)
+
+def check_password(raw: str, hashed: str):
+    return pwd_context.verify(raw, hashed)
+
+def generate_token(data: dict, expires: Optional[timedelta] = None):
+    payload = data.copy()
+    expire = datetime.utcnow() + (expires or timedelta(minutes=TOKEN_EXPIRY))
+    payload.update({"exp": expire})
+    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+def get_user_by_email(db: Session, email: str):
+    return db.query(User).filter(User.email == email).first()
+
+def get_authenticated_user(token: str = Depends(oauth2_scheme), db: Session = Depends(SessionLocal)):
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        email = payload.get("sub")
+        if not email:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        user = get_user_by_email(db, email)
+        if not user:
+            raise HTTPException(status_code=401, detail="User not found")
+        return user
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+# FastAPI app
+app = FastAPI()
+
+# Routes
+@app.post("/signup", response_model=Token)
+def register(user: UserCreate, db: Session = Depends(SessionLocal)):
+    if get_user_by_email(db, user.email):
+        raise HTTPException(status_code=400, detail="Email already in use")
+    user_obj = User(
+        name=user.name,
+        email=user.email,
+        hashed_password=hash_password(user.password),
+        role=user.role
+    )
+    db.add(user_obj)
+    db.commit()
+    db.refresh(user_obj)
+    token = generate_token({"sub": user.email})
+    return {"access_token": token, "token_type": "bearer"}
+
+@app.post("/login", response_model=Token)
+def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(SessionLocal)):
+    user = get_user_by_email(db, form_data.username)
+    if not user or not check_password(form_data.password, user.hashed_password):
+        raise HTTPException(status_code=400, detail="Invalid login")
+    token = generate_token({"sub": user.email})
+    return {"access_token": token, "token_type": "bearer"}
+
+@app.post("/assignments")
+def create_assignment(data: AssignmentCreate, current: User = Depends(get_authenticated_user), db: Session = Depends(SessionLocal)):
+    if current.role != "teacher":
+        raise HTTPException(status_code=403, detail="Only teachers can post assignments")
+    assignment = Assignment(
+        title=data.title,
+        description=data.description,
+        due_date=data.due_date,
+        teacher_id=current.id
+    )
+    db.add(assignment)
+    db.commit()
+    db.refresh(assignment)
+    return {"message": "Assignment created"}
+
+@app.post("/assignments/{assignment_id}/submit")
+def submit(assignment_id: int, data: SubmissionCreate, current: User = Depends(get_authenticated_user), db: Session = Depends(SessionLocal)):
+    if current.role != "student":
+        raise HTTPException(status_code=403, detail="Only students can submit assignments")
+    submission = Submission(
+        assignment_id=assignment_id,
+        student_id=current.id,
+        content=data.content,
+        file_url=data.file_url
+    )
+    db.add(submission)
+    db.commit()
+    db.refresh(submission)
+    return {"message": "Submitted successfully"}
+
+@app.get("/assignments/{assignment_id}/submissions", response_model=List[SubmissionOut])
+def get_submissions(assignment_id: int, current: User = Depends(get_authenticated_user), db: Session = Depends(SessionLocal)):
+    assignment = db.query(Assignment).filter(Assignment.id == assignment_id, Assignment.teacher_id == current.id).first()
+    if not assignment:
+        raise HTTPException(status_code=403, detail="Access denied")
+    return db.query(Submission).filter(Submission.assignment_id == assignment_id).all()
